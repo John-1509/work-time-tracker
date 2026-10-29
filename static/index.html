@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Work time tracker</title>
+<style>
+:root{--bg:#eef1f4;--panel:#fff;--ink:#17212b;--muted:#5d6b79;--line:#d3dae1;--accent:#0f6b6b;--danger:#b3261e;--run:#e6f4f0}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{padding:16px 24px 0}
+h1{margin:0;font-size:20px}
+h2{margin:0 0 12px;font-size:16px}
+main{display:grid;grid-template-columns:300px 1fr;gap:16px;padding:16px 24px 32px;align-items:start}
+@media(max-width:800px){main{grid-template-columns:1fr}}
+section{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:16px;margin-bottom:16px}
+input,button{font:inherit}
+input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:4px;background:#fff;color:var(--ink)}
+button{padding:8px 14px;border:1px solid var(--accent);border-radius:4px;background:var(--accent);color:#fff;cursor:pointer}
+button.quiet{background:#fff;color:var(--accent)}
+button.stop{background:var(--danger);border-color:var(--danger)}
+:focus-visible{outline:3px solid #f0b429;outline-offset:2px}
+.row{display:flex;gap:8px;align-items:end;flex-wrap:wrap}
+.row>label{flex:1;min-width:150px;font-size:13px;color:var(--muted)}
+ul{list-style:none;margin:12px 0 0;padding:0}
+li button{width:100%;text-align:left;background:#fff;color:var(--ink);border:1px solid var(--line);margin-bottom:6px}
+li button[aria-current="true"]{border-color:var(--accent);box-shadow:inset 4px 0 0 var(--accent)}
+li button.running{background:var(--run)}
+.sub{display:block;font-size:13px;color:var(--muted)}
+.clock{font-size:44px;font-weight:600;font-variant-numeric:tabular-nums;margin:4px 0}
+.muted{color:var(--muted)}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+th{font-size:13px;color:var(--muted);font-weight:600}
+td.num,th.num{text-align:right}
+.total{margin-top:12px;font-weight:600}
+#error{display:none;margin:12px 24px 0;padding:10px 14px;border:1px solid var(--danger);border-radius:4px;background:#fdecea;color:var(--danger)}
+.scroll{overflow-x:auto}
+.presets{margin-bottom:10px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Work time tracker</h1>
+  <p class="muted">Times are shown in your local time and stored in UTC.</p>
+</header>
+<div id="error" role="alert"></div>
+
+<main>
+  <div>
+    <section>
+      <h2>Employees</h2>
+      <form id="add-form" class="row">
+        <label>Name<input id="new-name" required maxlength="100" autocomplete="off"></label>
+        <button type="submit">Add employee</button>
+      </form>
+      <ul id="employee-list"></ul>
+    </section>
+  </div>
+
+  <div>
+    <section id="timer-panel" aria-live="polite"></section>
+
+    <section>
+      <h2>Period</h2>
+      <form id="period-form">
+        <div class="row presets">
+          <button type="button" class="quiet" id="today">Today</button>
+          <button type="button" class="quiet" id="yesterday">Yesterday</button>
+          <button type="button" class="quiet" id="week">Last 7 days</button>
+          <button type="button" class="quiet" id="month">This month</button>
+        </div>
+        <div class="row">
+          <button type="button" class="quiet" id="prev" aria-label="Earlier period">&larr;</button>
+          <label>From<input id="from" type="date"></label>
+          <label>To (included)<input id="to" type="date"></label>
+          <button type="button" class="quiet" id="next" aria-label="Later period">&rarr;</button>
+        </div>
+      </form>
+    </section>
+
+    <section>
+      <h2>Total time per employee</h2>
+      <div class="scroll"><table id="report"></table></div>
+    </section>
+
+    <section>
+      <h2 id="entries-title">Records</h2>
+      <div class="scroll"><table id="entries"></table></div>
+      <div class="total" id="entries-total"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let employees = [], selectedId = null, clockTimer = null;
+
+async function api(path, options = {}) {
+  const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(typeof data.detail === "string" ? data.detail : "Check the values you entered.");
+  }
+  return data;
+}
+
+function showError(message) {
+  const box = $("error");
+  box.textContent = message;
+  box.style.display = message ? "block" : "none";
+}
+
+async function run(action) {
+  try { showError(""); await action(); }
+  catch (err) { showError(err.message); }
+}
+
+function el(tag, text, className) {
+  const node = document.createElement(tag);
+  if (text !== undefined) node.textContent = text;
+  if (className) node.className = className;
+  return node;
+}
+
+const toDate = iso => new Date(iso.replace(/(\.\d{3})\d*Z$/, "$1Z"));
+const fmtTime = iso => toDate(iso).toLocaleString();
+
+function fmtDuration(seconds) {
+  const s = Math.round(seconds);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h + ":" + String(m).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
+}
+
+// Dates are picked as whole local days. "To" is included, so the server gets the next local midnight.
+const parseDay = value => { const [y, m, d] = value.split("-").map(Number); return new Date(y, m - 1, d); };
+const dayValue = date => date.getFullYear() + "-" + String(date.getMonth() + 1).padStart(2, "0") + "-" + String(date.getDate()).padStart(2, "0");
+const addDays = (date, n) => { const copy = new Date(date); copy.setDate(copy.getDate() + n); return copy; };
+
+function periodQuery() {
+  const params = new URLSearchParams();
+  if ($("from").value) params.set("from", parseDay($("from").value).toISOString());
+  if ($("to").value) params.set("to", addDays(parseDay($("to").value), 1).toISOString());
+  return params.toString() ? "?" + params : "";
+}
+
+function setRange(from, to) {
+  $("from").value = dayValue(from);
+  $("to").value = dayValue(to);
+  run(refresh);
+}
+
+function shiftRange(direction) {
+  if (!$("from").value || !$("to").value) return;
+  const from = parseDay($("from").value), to = parseDay($("to").value);
+  const length = Math.round((to - from) / 86400000) + 1;
+  setRange(addDays(from, direction * length), addDays(to, direction * length));
+}
+
+function today() { const now = new Date(); return new Date(now.getFullYear(), now.getMonth(), now.getDate()); }
+
+function renderEmployees() {
+  const list = $("employee-list");
+  list.replaceChildren();
+  if (!employees.length) { list.append(el("li", "No employees yet. Add the first one above.", "muted")); return; }
+  for (const emp of employees) {
+    const button = el("button", emp.name);
+    button.type = "button";
+    if (emp.id === selectedId) button.setAttribute("aria-current", "true");
+    if (emp.running) { button.classList.add("running"); button.append(el("span", "Running: " + emp.running.task, "sub")); }
+    button.onclick = () => run(() => select(emp.id));
+    const item = el("li"); item.append(button); list.append(item);
+  }
+}
+
+function renderTimer() {
+  clearInterval(clockTimer);
+  const panel = $("timer-panel");
+  panel.replaceChildren();
+  const emp = employees.find(e => e.id === selectedId);
+  if (!emp) { panel.append(el("h2", "Timer"), el("p", "Select an employee to start or stop a timer.", "muted")); return; }
+  panel.append(el("h2", emp.name));
+
+  if (emp.running) {
+    const clock = el("div", "0:00:00", "clock");
+    const tick = () => { clock.textContent = fmtDuration((Date.now() - toDate(emp.running.started_at)) / 1000); };
+    tick(); clockTimer = setInterval(tick, 1000);
+    const stop = el("button", "Stop timer", "stop");
+    stop.onclick = () => run(async () => { await api(`/employees/${emp.id}/timer/stop`, { method: "POST" }); await refresh(); });
+    panel.append(el("p", "Working on: " + emp.running.task), clock, stop);
+  } else {
+    const form = el("form", undefined, "row");
+    const label = el("label", "Task");
+    const input = el("input"); input.required = true; input.maxLength = 500; input.autocomplete = "off";
+    label.append(input);
+    const start = el("button", "Start timer"); start.type = "submit";
+    form.append(label, start);
+    form.onsubmit = event => { event.preventDefault(); run(async () => {
+      await api(`/employees/${emp.id}/timer/start`, { method: "POST", body: JSON.stringify({ task: input.value }) });
+      await refresh();
+    }); };
+    panel.append(form);
+  }
+}
+
+function fillTable(table, headers, rows) {
+  table.replaceChildren();
+  const head = el("tr");
+  headers.forEach(([text, numeric]) => head.append(el("th", text, numeric ? "num" : "")));
+  table.append(head);
+  rows.forEach(cells => {
+    const row = el("tr");
+    cells.forEach(([content, numeric]) => {
+      const cell = el("td", typeof content === "string" ? content : undefined, numeric ? "num" : "");
+      if (typeof content !== "string") cell.append(content);
+      row.append(cell);
+    });
+    table.append(row);
+  });
+}
+
+async function renderPeriod() {
+  const query = periodQuery();
+  const report = await api("/report" + query);
+  fillTable($("report"), [["Employee"], ["Total time", true]], report.employees.map(e => {
+    const link = el("button", e.name, "quiet"); link.type = "button";
+    link.onclick = () => run(() => select(e.id));
+    return [[link], [fmtDuration(e.total_seconds), true]];
+  }));
+  if (!report.employees.length) $("report").append(el("caption", "No employees yet, so there is nothing to total."));
+
+  const emp = employees.find(e => e.id === selectedId);
+  $("entries-title").textContent = emp ? "Records for " + emp.name : "Records";
+  $("entries").replaceChildren(); $("entries-total").textContent = "";
+  if (!emp) return;
+  const data = await api(`/employees/${emp.id}/entries` + query);
+  if (!data.entries.length) { $("entries-total").textContent = "No records in this period. Total: 0:00:00"; return; }
+  fillTable($("entries"), [["Task"], ["Start"], ["End"], ["Time in period", true]], data.entries.map(e => [
+    [e.task], [fmtTime(e.started_at)], [e.ended_at ? fmtTime(e.ended_at) : "Running"], [fmtDuration(e.counted_seconds), true],
+  ]));
+  $("entries-total").textContent = "Total: " + fmtDuration(data.total_seconds);
+}
+
+async function refresh() {
+  employees = await api("/employees");
+  if (!employees.some(e => e.id === selectedId)) selectedId = null;
+  renderEmployees(); renderTimer();
+  await renderPeriod();
+}
+
+async function select(id) { selectedId = id; await refresh(); }
+
+$("add-form").onsubmit = event => { event.preventDefault(); run(async () => {
+  const created = await api("/employees", { method: "POST", body: JSON.stringify({ name: $("new-name").value }) });
+  $("new-name").value = "";
+  await select(created.id);
+}); };
+$("period-form").onsubmit = event => { event.preventDefault(); run(refresh); };
+$("from").onchange = $("to").onchange = () => run(refresh);
+$("today").onclick = () => setRange(today(), today());
+$("yesterday").onclick = () => setRange(addDays(today(), -1), addDays(today(), -1));
+$("week").onclick = () => setRange(addDays(today(), -6), today());
+$("month").onclick = () => setRange(new Date(today().getFullYear(), today().getMonth(), 1), new Date(today().getFullYear(), today().getMonth() + 1, 0));
+$("prev").onclick = () => shiftRange(-1);
+$("next").onclick = () => shiftRange(1);
+
+$("from").value = $("to").value = dayValue(today());
+run(refresh);
+</script>
+</body>
+</html>
